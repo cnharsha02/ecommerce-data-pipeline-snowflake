@@ -1,0 +1,103 @@
+
+-- ============================================
+-- 02_tasks.sql
+-- ============================================
+
+USE SCHEMA ECOMMERCE_DB.STAGING;
+
+-- Task 1: Bronze to Silver (runs when stream has data)
+CREATE OR REPLACE TASK BRONZE_TO_SILVER_TASK
+    WAREHOUSE = ECOMMERCE_WH
+    SCHEDULE = 'USING CRON 0 */2 * * * Asia/Kolkata'
+    COMMENT = 'Incrementally load new data from Bronze to Silver'
+WHEN
+    SYSTEM$STREAM_HAS_DATA('ECOMMERCE_DB.BRONZE.BRONZE_SALES_STREAM')
+AS
+    MERGE INTO ECOMMERCE_DB.SILVER.CLEAN_ECOMMERCE_SALES AS target
+    USING (
+        SELECT
+            ORDER_ID,
+            CUSTOMER_ID,
+            INITCAP(TRIM(PRODUCT_CATEGORY))     AS PRODUCT_CATEGORY,
+            PRODUCT_PRICE                       AS PRODUCT_PRICE_USD,
+            QUANTITY,
+            ORDER_DATE,
+            YEAR(ORDER_DATE)                    AS ORDER_YEAR,
+            MONTH(ORDER_DATE)                   AS ORDER_MONTH,
+            QUARTER(ORDER_DATE)                 AS ORDER_QUARTER,
+            DAYNAME(ORDER_DATE)                 AS ORDER_DAY_OF_WEEK,
+            INITCAP(TRIM(REGION))               AS REGION,
+            INITCAP(TRIM(PAYMENT_METHOD))       AS PAYMENT_METHOD,
+            DELIVERY_DAYS,
+            CASE WHEN IS_RETURNED = 1 THEN TRUE ELSE FALSE END AS IS_RETURNED,
+            ROUND(CUSTOMER_RATING, 1)           AS CUSTOMER_RATING,
+            DISCOUNT_PERCENT,
+            ROUND(REVENUE, 2)                   AS REVENUE_USD,
+            ROUND(PRODUCT_PRICE * QUANTITY, 2)  AS GROSS_AMOUNT,
+            ROUND(PRODUCT_PRICE * QUANTITY * (DISCOUNT_PERCENT / 100), 2) AS DISCOUNT_AMOUNT,
+            CASE WHEN REVENUE > 500 THEN TRUE ELSE FALSE END AS IS_HIGH_VALUE_ORDER,
+            CASE
+                WHEN DELIVERY_DAYS <= 2 THEN 'Express'
+                WHEN DELIVERY_DAYS <= 5 THEN 'Standard'
+                ELSE 'Delayed'
+            END AS DELIVERY_CATEGORY,
+            CASE
+                WHEN CUSTOMER_RATING >= 4 THEN 'Positive'
+                WHEN CUSTOMER_RATING >= 3 THEN 'Neutral'
+                ELSE 'Negative'
+            END AS RATING_CATEGORY,
+            _LOADED_AT,
+            CURRENT_TIMESTAMP() AS _TRANSFORMED_AT,
+            _SOURCE_FILE
+        FROM ECOMMERCE_DB.BRONZE.BRONZE_SALES_STREAM
+    ) AS source
+    ON target.ORDER_ID = source.ORDER_ID
+    WHEN NOT MATCHED THEN INSERT VALUES (
+        source.ORDER_ID, source.CUSTOMER_ID, source.PRODUCT_CATEGORY,
+        source.PRODUCT_PRICE_USD, source.QUANTITY, source.ORDER_DATE,
+        source.ORDER_YEAR, source.ORDER_MONTH, source.ORDER_QUARTER,
+        source.ORDER_DAY_OF_WEEK, source.REGION, source.PAYMENT_METHOD,
+        source.DELIVERY_DAYS, source.IS_RETURNED, source.CUSTOMER_RATING,
+        source.DISCOUNT_PERCENT, source.REVENUE_USD, source.GROSS_AMOUNT,
+        source.DISCOUNT_AMOUNT, source.IS_HIGH_VALUE_ORDER,
+        source.DELIVERY_CATEGORY, source.RATING_CATEGORY,
+        source._LOADED_AT, source._TRANSFORMED_AT, source._SOURCE_FILE
+    );
+
+-- Task 2: Refresh Gold tables (child task, runs after Task 1)
+CREATE OR REPLACE TASK SILVER_TO_GOLD_TASK
+    WAREHOUSE = ECOMMERCE_WH
+    AFTER BRONZE_TO_SILVER_TASK
+    COMMENT = 'Refresh Gold layer aggregations after Silver is updated'
+AS
+    BEGIN
+        CREATE OR REPLACE TABLE ECOMMERCE_DB.GOLD.DAILY_SALES_SUMMARY AS
+        SELECT ORDER_DATE, ORDER_YEAR, ORDER_MONTH, ORDER_QUARTER, ORDER_DAY_OF_WEEK,
+            COUNT(DISTINCT ORDER_ID) AS TOTAL_ORDERS,
+            COUNT(DISTINCT CUSTOMER_ID) AS UNIQUE_CUSTOMERS,
+            SUM(REVENUE_USD) AS TOTAL_REVENUE,
+            AVG(REVENUE_USD) AS AVG_ORDER_VALUE,
+            SUM(DISCOUNT_AMOUNT) AS TOTAL_DISCOUNTS,
+            SUM(CASE WHEN IS_RETURNED THEN 1 ELSE 0 END) AS RETURNED_ORDERS,
+            ROUND(AVG(CUSTOMER_RATING), 2) AS AVG_RATING,
+            ROUND(AVG(DELIVERY_DAYS), 1) AS AVG_DELIVERY_DAYS
+        FROM ECOMMERCE_DB.SILVER.CLEAN_ECOMMERCE_SALES
+        GROUP BY 1, 2, 3, 4, 5;
+
+        CREATE OR REPLACE TABLE ECOMMERCE_DB.GOLD.PRODUCT_CATEGORY_PERFORMANCE AS
+        SELECT PRODUCT_CATEGORY,
+            COUNT(DISTINCT ORDER_ID) AS TOTAL_ORDERS,
+            SUM(QUANTITY) AS TOTAL_UNITS_SOLD,
+            SUM(REVENUE_USD) AS TOTAL_REVENUE,
+            ROUND(AVG(CUSTOMER_RATING), 2) AS AVG_RATING,
+            ROUND(SUM(CASE WHEN IS_RETURNED THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS RETURN_RATE_PCT
+        FROM ECOMMERCE_DB.SILVER.CLEAN_ECOMMERCE_SALES
+        GROUP BY 1;
+    END;
+
+-- Resume tasks (created in suspended state by default)
+ALTER TASK SILVER_TO_GOLD_TASK RESUME;
+ALTER TASK BRONZE_TO_SILVER_TASK RESUME;
+
+-- Verify tasks
+SHOW TASKS;
